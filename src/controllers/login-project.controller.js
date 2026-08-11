@@ -87,7 +87,8 @@ authUserRouter.post("/login", async (req, res) => {
                 name,
                 email,
                 password,
-                department
+                department,
+                role
             FROM ${db}.users
             WHERE email = ?
             LIMIT 1
