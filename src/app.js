@@ -18,7 +18,7 @@ app.get("/", (req, res) => {
 });
 
 // Rutas principales
-app.use("/arvix-manager/server/v1", routes);
+app.use("/edenlabs-manager/server/v1", routes);
 
 // Middleware de errores
 app.use(errorMiddleware);
