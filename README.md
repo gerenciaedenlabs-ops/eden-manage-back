@@ -1,1 +1,1 @@
-# Arvix Manager Backend
+# EdenLabs Manager Backend
