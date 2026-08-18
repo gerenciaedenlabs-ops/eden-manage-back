@@ -53,6 +53,75 @@ tasksRouter.post("/", async (req, res) => {
     }
 });
 
+// ======================== GET tarea (detalle completo) ========================
+// El listado del tablero (/project/partners/:id) manda la descripción truncada
+// para no descargar cientos de KB de texto en cada carga; esta ruta trae la
+// tarea puntual con su descripción completa y la de sus subtareas, para cuando
+// se abre el modal de detalle.
+tasksRouter.get("/:id", async (req, res) => {
+    const { id } = req.params;
+
+    let conn;
+
+    try {
+        conn = await getConnection();
+        const db = env.db.database;
+
+        const [[task]] = await conn.query(
+            `SELECT t.id, t.project_id, t.parent_id, t.title, t.description, t.tags, t.due_date, t.created_by, u.name as assigned_to, creator.name as created_by_name, t.status
+             FROM ${db}.tasks t
+             LEFT JOIN ${db}.users u ON t.assigned_to = u.id
+             LEFT JOIN ${db}.users creator ON t.created_by = creator.id
+             WHERE t.id = ?`,
+            [id]
+        );
+
+        if (!task) {
+            return res.status(404).json({ status: "error", message: "Tarea no encontrada" });
+        }
+
+        const [subtasks] = await conn.query(
+            `SELECT t.id, t.project_id, t.parent_id, t.title, t.description, t.tags, t.due_date, t.created_by, u.name as assigned_to, creator.name as created_by_name, t.status
+             FROM ${db}.tasks t
+             LEFT JOIN ${db}.users u ON t.assigned_to = u.id
+             LEFT JOIN ${db}.users creator ON t.created_by = creator.id
+             WHERE t.parent_id = ?
+             ORDER BY t.id ASC`,
+            [id]
+        );
+
+        const allIds = [task.id, ...subtasks.map((s) => s.id)];
+        const placeholders = allIds.map(() => "?").join(",");
+        const [checklistRows] = await conn.query(
+            `SELECT id, task_id, label, is_checked FROM ${db}.task_checklist_items WHERE task_id IN (${placeholders}) ORDER BY position ASC, id ASC`,
+            allIds
+        );
+
+        const checklistByTask = {};
+        checklistRows.forEach((item) => {
+            if (!checklistByTask[item.task_id]) checklistByTask[item.task_id] = [];
+            checklistByTask[item.task_id].push(item);
+        });
+
+        task.checklist = checklistByTask[task.id] || [];
+        task.subtasks = subtasks.map((s) => ({ ...s, checklist: checklistByTask[s.id] || [] }));
+
+        return res.json({ status: "ok", data: task });
+
+    } catch (error) {
+        logger.error("Error obteniendo detalle de tarea:", error);
+
+        return res.status(500).json({
+            status: "error",
+            message: "Error interno del servidor",
+            error: error.message
+        });
+
+    } finally {
+        if (conn) conn.release();
+    }
+});
+
 // ======================== PUT ========================
 tasksRouter.put("/:id", async (req, res) => {
     const { id } = req.params;

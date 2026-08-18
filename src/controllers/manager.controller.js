@@ -264,8 +264,18 @@ projectManagerRouter.get("/partners/:project_id", async (req, res) => {
     conn = await getConnection();
     const db = env.db.database;
 
+    // La descripción va truncada en el listado del tablero: con cientos de
+    // tareas, mandar el texto completo de cada una (criterios de aceptación
+    // incluidos) puede pesar varios cientos de KB por carga, aunque la tarjeta
+    // solo muestra una línea. El texto completo se trae aparte por tarea
+    // (GET /task/:id) cuando se abre el detalle.
+    const DESCRIPTION_PREVIEW_LENGTH = 300;
+
     const rootQuery = `
-        SELECT t.id, t.project_id, t.parent_id, t.title, t.description, t.tags, t.due_date, t.created_by, u.name as assigned_to, creator.name as created_by_name, t.status
+        SELECT t.id, t.project_id, t.parent_id, t.title,
+        LEFT(t.description, ${DESCRIPTION_PREVIEW_LENGTH}) as description,
+        (CHAR_LENGTH(t.description) > ${DESCRIPTION_PREVIEW_LENGTH}) as description_truncated,
+        t.tags, t.due_date, t.created_by, u.name as assigned_to, creator.name as created_by_name, t.status
         FROM ${db}.tasks t
         LEFT JOIN ${db}.users u
         ON t.assigned_to = u.id
@@ -285,7 +295,10 @@ projectManagerRouter.get("/partners/:project_id", async (req, res) => {
     }
 
     const subQuery = `
-        SELECT t.id, t.project_id, t.parent_id, t.title, t.description, t.tags, t.due_date, t.created_by, u.name as assigned_to, creator.name as created_by_name, t.status
+        SELECT t.id, t.project_id, t.parent_id, t.title,
+        LEFT(t.description, ${DESCRIPTION_PREVIEW_LENGTH}) as description,
+        (CHAR_LENGTH(t.description) > ${DESCRIPTION_PREVIEW_LENGTH}) as description_truncated,
+        t.tags, t.due_date, t.created_by, u.name as assigned_to, creator.name as created_by_name, t.status
         FROM ${db}.tasks t
         LEFT JOIN ${db}.users u
         ON t.assigned_to = u.id
