@@ -9,12 +9,12 @@ const TABLE = "tasks";
 
 // ======================== POST tarea ========================
 tasksRouter.post("/", async (req, res) => {
-    const { project_id, title, description, assigned_to, status } = req.body;
+    const { project_id, title, description, assigned_to, status, parent_id, tags, due_date } = req.body;
 
-    if (!project_id || !title || !description || !assigned_to || !status) {
+    if (!project_id || !title || !description || !status) {
         return res.status(400).json({
             status: "error",
-            message: "Datos incompletos: se requiere project_id, title, description, assigned_to y status"
+            message: "Datos incompletos: se requiere project_id, title, description y status"
         });
     }
 
@@ -25,10 +25,10 @@ tasksRouter.post("/", async (req, res) => {
         const db = env.db.database;
 
         const query = `
-      INSERT INTO ${db}.tasks (project_id, title, description, assigned_to, status) VALUES (?, ?, ?, ?, ?)
+      INSERT INTO ${db}.tasks (project_id, title, description, assigned_to, status, parent_id, tags, due_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `;
 
-        await conn.query(query, [project_id, title, description, assigned_to, status]);
+        await conn.query(query, [project_id, title, description, assigned_to || null, status, parent_id || null, tags || null, due_date || null]);
 
         return res.status(201).json({
             status: "ok",
@@ -52,7 +52,7 @@ tasksRouter.post("/", async (req, res) => {
 // ======================== PUT ========================
 tasksRouter.put("/:id", async (req, res) => {
     const { id } = req.params;
-    const { title, description, assigned_to } = req.body;
+    const { title, description, assigned_to, tags, due_date } = req.body;
 
     if (!id) {
         return res.status(400).json({
@@ -61,10 +61,10 @@ tasksRouter.put("/:id", async (req, res) => {
         });
     }
 
-    if (!title || !description || !assigned_to) {
+    if (!title || !description) {
         return res.status(400).json({
             status: "error",
-            message: "Datos incompletos: se requiere title, description y assigned_to"
+            message: "Datos incompletos: se requiere title y description"
         });
     }
 
@@ -74,11 +74,26 @@ tasksRouter.put("/:id", async (req, res) => {
         conn = await getConnection();
         const db = env.db.database;
 
-        const query = `
-        UPDATE ${db}.${TABLE} SET title = ?, description = ?, assigned_to = ? WHERE id = ?;
-        `;
+        // tags/due_date son opcionales: si no vienen en el body, se dejan intactos
+        // (no se pisan con NULL) para no perder datos al editar solo otros campos.
+        const fields = ["title = ?", "description = ?", "assigned_to = ?"];
+        const values = [title, description, assigned_to || null];
 
-        const [result] = await conn.query(query, [title, description, assigned_to, id]);
+        if (tags !== undefined) {
+            fields.push("tags = ?");
+            values.push(tags || null);
+        }
+
+        if (due_date !== undefined) {
+            fields.push("due_date = ?");
+            values.push(due_date || null);
+        }
+
+        values.push(id);
+
+        const query = `UPDATE ${db}.${TABLE} SET ${fields.join(", ")} WHERE id = ?;`;
+
+        const [result] = await conn.query(query, values);
 
         if (result.affectedRows === 0) {
             return res.status(404).json({
@@ -151,6 +166,50 @@ tasksRouter.put("/state/:id", async (req, res) => {
 
     } catch (error) {
         logger.error("Error actualizando ModulePermissions:", error);
+
+        return res.status(500).json({
+            status: "error",
+            message: "Error interno del servidor",
+            error: error.message
+        });
+
+    } finally {
+        if (conn) conn.release();
+    }
+});
+
+// ======================== POST checklist item ========================
+tasksRouter.post("/:id/checklist", async (req, res) => {
+    const { id } = req.params;
+    const { label } = req.body;
+
+    if (!label || !label.trim()) {
+        return res.status(400).json({
+            status: "error",
+            message: "Datos incompletos: se requiere label"
+        });
+    }
+
+    let conn;
+
+    try {
+        conn = await getConnection();
+        const db = env.db.database;
+
+        const query = `
+        INSERT INTO ${db}.task_checklist_items (task_id, label) VALUES (?, ?)
+        `;
+
+        const [result] = await conn.query(query, [id, label.trim()]);
+
+        return res.status(201).json({
+            status: "ok",
+            message: "Item de checklist creado con éxito",
+            data: { id: result.insertId, task_id: Number(id), label: label.trim(), is_checked: 0 }
+        });
+
+    } catch (error) {
+        logger.error("Error creando checklist item:", error);
 
         return res.status(500).json({
             status: "error",
