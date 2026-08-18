@@ -1,0 +1,14 @@
+ALTER TABLE tasks
+  ADD COLUMN parent_id INT NULL AFTER project_id,
+  ADD COLUMN tags VARCHAR(100) NULL AFTER description,
+  ADD CONSTRAINT fk_tasks_parent FOREIGN KEY (parent_id) REFERENCES tasks(id) ON DELETE CASCADE;
+
+CREATE TABLE task_checklist_items (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  task_id INT NOT NULL,
+  label VARCHAR(500) NOT NULL,
+  is_checked TINYINT(1) NOT NULL DEFAULT 0,
+  position INT NOT NULL DEFAULT 0,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_checklist_task FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
