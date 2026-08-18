@@ -2,6 +2,7 @@ import { Router } from "express";
 import { getConnection } from "../database/connection.js";
 import { logger } from "../config/logger.js";
 import { env } from "../config/env.js";
+import { isAdminUser } from "../utils/permissions.js";
 
 export const tasksRouter = Router();
 
@@ -25,10 +26,13 @@ tasksRouter.post("/", async (req, res) => {
         const db = env.db.database;
 
         const query = `
-      INSERT INTO ${db}.tasks (project_id, title, description, assigned_to, status, parent_id, tags, due_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO ${db}.tasks (project_id, title, description, assigned_to, status, parent_id, tags, due_date, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `;
 
-        await conn.query(query, [project_id, title, description, assigned_to || null, status, parent_id || null, tags || null, due_date || null]);
+        // created_by nunca se toma del body: siempre es el usuario autenticado real
+        // (req.user.id viene del JWT verificado por authMiddleware), para que nadie
+        // pueda atribuirse una tarea a otra persona.
+        await conn.query(query, [project_id, title, description, assigned_to || null, status, parent_id || null, tags || null, due_date || null, req.user.id]);
 
         return res.status(201).json({
             status: "ok",
@@ -73,6 +77,20 @@ tasksRouter.put("/:id", async (req, res) => {
     try {
         conn = await getConnection();
         const db = env.db.database;
+
+        const [[existing]] = await conn.query(`SELECT created_by FROM ${db}.${TABLE} WHERE id = ?`, [id]);
+
+        if (!existing) {
+            return res.status(404).json({ status: "error", message: "No se encontró el registro a actualizar" });
+        }
+
+        const admin = await isAdminUser(conn, db, req.user.id);
+        if (!admin && existing.created_by !== req.user.id) {
+            return res.status(403).json({
+                status: "error",
+                message: "Solo puedes editar tareas que tú creaste"
+            });
+        }
 
         // tags/due_date son opcionales: si no vienen en el body, se dejan intactos
         // (no se pisan con NULL) para no perder datos al editar solo otros campos.
@@ -238,6 +256,20 @@ tasksRouter.delete("/:id", async (req, res) => {
     try {
         conn = await getConnection();
         const db = env.db.database;
+
+        const [[existing]] = await conn.query(`SELECT created_by FROM ${db}.${TABLE} WHERE id = ?`, [id]);
+
+        if (!existing) {
+            return res.status(404).json({ status: "error", message: "No se encontró el registro a eliminar" });
+        }
+
+        const admin = await isAdminUser(conn, db, req.user.id);
+        if (!admin && existing.created_by !== req.user.id) {
+            return res.status(403).json({
+                status: "error",
+                message: "Solo puedes eliminar tareas que tú creaste"
+            });
+        }
 
         const query = `
             DELETE FROM ${db}.${TABLE} WHERE id = ?;

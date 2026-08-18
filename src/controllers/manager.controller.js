@@ -56,11 +56,11 @@ const bulkInsertTasks = async (conn, db, rows) => {
   const ids = [];
 
   for (const batch of chunkArray(rows, IMPORT_CHUNK_SIZE)) {
-    const placeholders = batch.map(() => "(?, ?, ?, NULL, 'pending', ?, ?)").join(", ");
+    const placeholders = batch.map(() => "(?, ?, ?, NULL, 'pending', ?, ?, ?)").join(", ");
     const values = batch.flat();
 
     const [result] = await conn.query(
-      `INSERT INTO ${db}.tasks (project_id, title, description, assigned_to, status, parent_id, tags) VALUES ${placeholders}`,
+      `INSERT INTO ${db}.tasks (project_id, title, description, assigned_to, status, parent_id, tags, created_by) VALUES ${placeholders}`,
       values
     );
 
@@ -265,10 +265,12 @@ projectManagerRouter.get("/partners/:project_id", async (req, res) => {
     const db = env.db.database;
 
     const rootQuery = `
-        SELECT t.id, t.project_id, t.parent_id, t.title, t.description, t.tags, t.due_date, u.name as assigned_to, t.status
+        SELECT t.id, t.project_id, t.parent_id, t.title, t.description, t.tags, t.due_date, t.created_by, u.name as assigned_to, creator.name as created_by_name, t.status
         FROM ${db}.tasks t
         LEFT JOIN ${db}.users u
         ON t.assigned_to = u.id
+        LEFT JOIN ${db}.users creator
+        ON t.created_by = creator.id
         WHERE t.project_id = ? AND t.parent_id IS NULL
         ORDER BY t.id ASC
         `;
@@ -283,10 +285,12 @@ projectManagerRouter.get("/partners/:project_id", async (req, res) => {
     }
 
     const subQuery = `
-        SELECT t.id, t.project_id, t.parent_id, t.title, t.description, t.tags, t.due_date, u.name as assigned_to, t.status
+        SELECT t.id, t.project_id, t.parent_id, t.title, t.description, t.tags, t.due_date, t.created_by, u.name as assigned_to, creator.name as created_by_name, t.status
         FROM ${db}.tasks t
         LEFT JOIN ${db}.users u
         ON t.assigned_to = u.id
+        LEFT JOIN ${db}.users creator
+        ON t.created_by = creator.id
         WHERE t.project_id = ? AND t.parent_id IS NOT NULL
         ORDER BY t.id ASC
         `;
@@ -349,7 +353,7 @@ projectManagerRouter.get("/partners/:project_id", async (req, res) => {
 // ======================== POST importar tareas desde Excel ========================
 projectManagerRouter.post("/:project_id/import-tasks", async (req, res) => {
   const { project_id } = req.params;
-  const { rows } = req.body;
+  const { rows, created_by } = req.body;
 
   if (!project_id) {
     return res.status(400).json({
@@ -383,6 +387,7 @@ projectManagerRouter.post("/:project_id/import-tasks", async (req, res) => {
       row.descripcion || "",
       null,
       row.tags || null,
+      created_by || null,
     ]);
     const rootIds = await bulkInsertTasks(conn, db, rootInsertRows);
 
@@ -409,6 +414,7 @@ projectManagerRouter.post("/:project_id/import-tasks", async (req, res) => {
       row.descripcion || "",
       row.parentId,
       row.tag,
+      created_by || null,
     ]);
     const subtaskIds = await bulkInsertTasks(conn, db, subtaskInsertRows);
 

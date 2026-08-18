@@ -1,0 +1,1 @@
+ALTER TABLE tasks MODIFY title VARCHAR(500);
