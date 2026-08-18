@@ -15,7 +15,9 @@ app.use((req, res, next) => {
 });
 
 app.use(cors());
-app.use(express.json());
+// Los imports masivos de tareas (Excel con muchas filas/descripciones largas)
+// superan fácilmente el límite por defecto de 100kb de express.json().
+app.use(express.json({ limit: "20mb" }));
 app.use(morgan("dev"));
 
 app.get("/", (req, res) => {
