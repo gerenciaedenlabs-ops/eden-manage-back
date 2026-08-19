@@ -10,6 +10,7 @@ import { projectManagerRouter } from "../controllers/manager.controller.js";
 import { tasksRouter } from "../controllers/tasks-project.controller.js";
 import { checklistRouter } from "../controllers/checklist.controller.js";
 import { gerenciaRouter } from "../controllers/gerencia.controller.js";
+import { notificationsRouter } from "../controllers/notifications.controller.js";
 import { usersRouter } from "../controllers/user.controller.js";
 import { pricesRouter } from "../controllers/prices-project.controller.js";
 import { authMiddleware } from "../middlewares/auth.middleware.js";
@@ -34,6 +35,7 @@ router.use("/project", projectManagerRouter);
 router.use("/task", authMiddleware, tasksRouter);
 router.use("/checklist", authMiddleware, checklistRouter);
 router.use("/gerencia", authMiddleware, requireAdmin, gerenciaRouter);
+router.use("/notifications", authMiddleware, notificationsRouter);
 router.use("/user", usersRouter);
 router.use("/prices", pricesRouter);
 

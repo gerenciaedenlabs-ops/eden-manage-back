@@ -8,6 +8,17 @@ export const tasksRouter = Router();
 
 const TABLE = "tasks";
 
+// Crea la notificación de "te asignaron una tarea" cuando assigned_to apunta
+// a alguien distinto de quien hace la acción (no te notificas a ti mismo).
+const notifyAssignee = async (conn, db, { assignedTo, actingUserId, taskId, title }) => {
+    if (!assignedTo || Number(assignedTo) === Number(actingUserId)) return;
+
+    await conn.query(
+        `INSERT INTO ${db}.notifications (user_id, type, message, related_task_id) VALUES (?, 'task_assigned', ?, ?)`,
+        [assignedTo, `Se te asignó la tarea: ${title}`, taskId]
+    );
+};
+
 // ======================== POST tarea ========================
 tasksRouter.post("/", async (req, res) => {
     const { project_id, title, description, assigned_to, status, parent_id, tags, due_date } = req.body;
@@ -32,7 +43,14 @@ tasksRouter.post("/", async (req, res) => {
         // created_by nunca se toma del body: siempre es el usuario autenticado real
         // (req.user.id viene del JWT verificado por authMiddleware), para que nadie
         // pueda atribuirse una tarea a otra persona.
-        await conn.query(query, [project_id, title, description, assigned_to || null, status, parent_id || null, tags || null, due_date || null, req.user.id]);
+        const [result] = await conn.query(query, [project_id, title, description, assigned_to || null, status, parent_id || null, tags || null, due_date || null, req.user.id]);
+
+        await notifyAssignee(conn, db, {
+            assignedTo: assigned_to,
+            actingUserId: req.user.id,
+            taskId: result.insertId,
+            title,
+        });
 
         return res.status(201).json({
             status: "ok",
@@ -147,7 +165,7 @@ tasksRouter.put("/:id", async (req, res) => {
         conn = await getConnection();
         const db = env.db.database;
 
-        const [[existing]] = await conn.query(`SELECT created_by FROM ${db}.${TABLE} WHERE id = ?`, [id]);
+        const [[existing]] = await conn.query(`SELECT created_by, assigned_to FROM ${db}.${TABLE} WHERE id = ?`, [id]);
 
         if (!existing) {
             return res.status(404).json({ status: "error", message: "No se encontró el registro a actualizar" });
@@ -186,6 +204,17 @@ tasksRouter.put("/:id", async (req, res) => {
             return res.status(404).json({
                 status: "error",
                 message: "No se encontró el registro a actualizar"
+            });
+        }
+
+        // Solo notifica si el colaborador asignado cambió a otra persona
+        // (no en cada edición de título/descripción sobre la misma asignación).
+        if (Number(assigned_to) !== Number(existing.assigned_to)) {
+            await notifyAssignee(conn, db, {
+                assignedTo: assigned_to,
+                actingUserId: req.user.id,
+                taskId: id,
+                title,
             });
         }
 
