@@ -139,7 +139,12 @@ projectManagerRouter.get("/project-freelance", async (req, res) => {
     const db = env.db.database;
 
     const query = `
-        SELECT id, title, description, progress, status FROM ${db}.projects WHERE type_id = 2
+        SELECT p.id, p.title, p.description, p.status,
+          COALESCE(ROUND(SUM(t.status = 'completed') / NULLIF(COUNT(t.id), 0) * 100, 2), 0) as progress
+        FROM ${db}.projects p
+        LEFT JOIN ${db}.tasks t ON t.project_id = p.id
+        WHERE p.type_id = 2
+        GROUP BY p.id, p.title, p.description, p.status
         `;
 
     const [rows] = await conn.query(query);
@@ -221,7 +226,12 @@ projectManagerRouter.get("/project-active", async (req, res) => {
     const db = env.db.database;
 
     const query = `
-      SELECT id, title, description, progress, status, type_id FROM ${db}.projects WHERE activate = 1
+      SELECT p.id, p.title, p.description, p.status, p.type_id,
+        COALESCE(ROUND(SUM(t.status = 'completed') / NULLIF(COUNT(t.id), 0) * 100, 2), 0) as progress
+      FROM ${db}.projects p
+      LEFT JOIN ${db}.tasks t ON t.project_id = p.id
+      WHERE p.activate = 1
+      GROUP BY p.id, p.title, p.description, p.status, p.type_id
       `;
 
     const [rows] = await conn.query(query);
