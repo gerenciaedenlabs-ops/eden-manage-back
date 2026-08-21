@@ -49,6 +49,11 @@ const chunkArray = (arr, size) => {
   return chunks;
 };
 
+// Estados válidos del tablero: cualquier otro valor (o ausente, como en la
+// plantilla plana original que no manda status) cae en "pending".
+const VALID_IMPORT_STATUSES = new Set(["pending", "inProgress", "completed"]);
+const normalizeImportStatus = (status) => (VALID_IMPORT_STATUSES.has(status) ? status : "pending");
+
 // Inserta tareas/subtareas en bloques de IMPORT_CHUNK_SIZE filas por statement.
 // Los ids se derivan de result.insertId + índice: en un INSERT multi-fila simple,
 // MySQL siempre reserva ids AUTO_INCREMENT contiguos para ese statement.
@@ -56,7 +61,7 @@ const bulkInsertTasks = async (conn, db, rows) => {
   const ids = [];
 
   for (const batch of chunkArray(rows, IMPORT_CHUNK_SIZE)) {
-    const placeholders = batch.map(() => "(?, ?, ?, NULL, 'pending', ?, ?, ?)").join(", ");
+    const placeholders = batch.map(() => "(?, ?, ?, NULL, ?, ?, ?, ?)").join(", ");
     const values = batch.flat();
 
     const [result] = await conn.query(
@@ -398,6 +403,7 @@ projectManagerRouter.post("/:project_id/import-tasks", async (req, res) => {
       project_id,
       row.titulo.trim(),
       row.descripcion || "",
+      normalizeImportStatus(row.status),
       null,
       row.tags || null,
       created_by || null,
@@ -425,6 +431,7 @@ projectManagerRouter.post("/:project_id/import-tasks", async (req, res) => {
       project_id,
       row.cleanTitle,
       row.descripcion || "",
+      normalizeImportStatus(row.status),
       row.parentId,
       row.tag,
       created_by || null,
