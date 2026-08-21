@@ -320,6 +320,29 @@ personalFinanceRouter.delete("/transactions/:id", async (req, res) => {
   }
 });
 
+// Calcula las filas de cuotas para una deuda (usado al crear y al editar el
+// monto/fecha/número de cuotas). Monto base redondeado a centavos; la última
+// cuota absorbe el residuo de redondeo para que la suma cuadre exacto.
+const buildInstallmentRows = (debtId, totalAmount, count, startDate) => {
+  const baseInstallment = Math.floor((totalAmount / count) * 100) / 100;
+  const values = [];
+
+  for (let i = 1; i <= count; i++) {
+    const dueDate = new Date(startDate);
+    dueDate.setMonth(dueDate.getMonth() + i);
+    const dueDateStr = dueDate.toISOString().slice(0, 10);
+
+    const isLast = i === count;
+    const installmentAmount = isLast
+      ? Math.round((totalAmount - baseInstallment * (count - 1)) * 100) / 100
+      : baseInstallment;
+
+    values.push(debtId, i, dueDateStr, installmentAmount);
+  }
+
+  return values;
+};
+
 // ======================== GET deudas (con cuotas anidadas) ========================
 personalFinanceRouter.get("/debts", async (req, res) => {
   let conn;
@@ -403,24 +426,7 @@ personalFinanceRouter.post("/debts", async (req, res) => {
 
     const debtId = result.insertId;
 
-    // Monto base por cuota, redondeado a centavos; la última cuota absorbe el residuo
-    // de redondeo para que la suma cuadre exacto con el monto total.
-    const baseInstallment = Math.floor((totalAmount / count) * 100) / 100;
-    const values = [];
-
-    for (let i = 1; i <= count; i++) {
-      const dueDate = new Date(start_date);
-      dueDate.setMonth(dueDate.getMonth() + i);
-      const dueDateStr = dueDate.toISOString().slice(0, 10);
-
-      const isLast = i === count;
-      const installmentAmount = isLast
-        ? Math.round((totalAmount - baseInstallment * (count - 1)) * 100) / 100
-        : baseInstallment;
-
-      values.push(debtId, i, dueDateStr, installmentAmount);
-    }
-
+    const values = buildInstallmentRows(debtId, totalAmount, count, start_date);
     const placeholders = Array(count).fill("(?, ?, ?, ?)").join(", ");
     await conn.query(
       `INSERT INTO ${db}.personal_debt_installments (debt_id, installment_number, due_date, amount) VALUES ${placeholders}`,
@@ -433,6 +439,95 @@ personalFinanceRouter.post("/debts", async (req, res) => {
   } catch (error) {
     if (conn) await conn.rollback();
     logger.error("Error creando deuda personal:", error);
+    return res.status(500).json({ status: "error", message: "Error interno del servidor", error: error.message });
+  } finally {
+    if (conn) conn.release();
+  }
+});
+
+// ======================== PUT editar deuda ========================
+// title/reason se pueden editar siempre. amount/start_date/installments_count
+// cambian el calendario de cuotas, así que se regeneran desde cero — pero solo
+// si NINGUNA cuota está pagada todavía (si no, se perdería el historial real
+// de pagos). Con cuotas ya pagadas, solo quedan editables title/reason.
+personalFinanceRouter.put("/debts/:id", async (req, res) => {
+  const { id } = req.params;
+  const { title, reason, amount, start_date, installments_count } = req.body;
+
+  let conn;
+
+  try {
+    conn = await getConnection();
+    const db = env.db.database;
+
+    const [[debt]] = await conn.query(
+      `SELECT * FROM ${db}.personal_debts WHERE id = ? AND user_id = ?`,
+      [id, req.user.id]
+    );
+
+    if (!debt) {
+      return res.status(404).json({ status: "error", message: "No se encontró la deuda" });
+    }
+
+    const wantsScheduleChange =
+      amount !== undefined || start_date !== undefined || installments_count !== undefined;
+
+    if (wantsScheduleChange) {
+      const [[{ paidCount }]] = await conn.query(
+        `SELECT COUNT(*) AS paidCount FROM ${db}.personal_debt_installments WHERE debt_id = ? AND paid = 1`,
+        [id]
+      );
+
+      if (paidCount > 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "No puedes cambiar el monto, la fecha o el número de cuotas de una deuda que ya tiene cuotas pagadas. Elimínala y créala de nuevo si necesitas corregirla.",
+        });
+      }
+
+      const newAmount = amount !== undefined ? Number(amount) : Number(debt.amount);
+      const newStartDate = start_date !== undefined ? start_date : debt.start_date;
+      const newCount = installments_count !== undefined ? Number(installments_count) : debt.installments_count;
+
+      if (!newAmount || newAmount <= 0) {
+        return res.status(400).json({ status: "error", message: "amount debe ser mayor a 0" });
+      }
+      if (!Number.isInteger(newCount) || newCount < 1) {
+        return res.status(400).json({ status: "error", message: "installments_count debe ser un entero mayor a 0" });
+      }
+
+      await conn.beginTransaction();
+
+      await conn.query(
+        `UPDATE ${db}.personal_debts SET title = ?, reason = ?, amount = ?, start_date = ?, installments_count = ? WHERE id = ?`,
+        [title !== undefined ? title : debt.title, reason !== undefined ? reason : debt.reason, newAmount, newStartDate, newCount, id]
+      );
+
+      await conn.query(`DELETE FROM ${db}.personal_debt_installments WHERE debt_id = ?`, [id]);
+
+      const values = buildInstallmentRows(Number(id), newAmount, newCount, newStartDate);
+      const placeholders = Array(newCount).fill("(?, ?, ?, ?)").join(", ");
+      await conn.query(
+        `INSERT INTO ${db}.personal_debt_installments (debt_id, installment_number, due_date, amount) VALUES ${placeholders}`,
+        values
+      );
+
+      await conn.commit();
+    } else {
+      if (title === undefined && reason === undefined) {
+        return res.status(400).json({ status: "error", message: "No hay datos para actualizar" });
+      }
+
+      await conn.query(
+        `UPDATE ${db}.personal_debts SET title = ?, reason = ? WHERE id = ?`,
+        [title !== undefined ? title : debt.title, reason !== undefined ? reason : debt.reason, id]
+      );
+    }
+
+    return res.json({ status: "ok", message: "Deuda actualizada con éxito" });
+  } catch (error) {
+    if (conn) await conn.rollback();
+    logger.error("Error actualizando deuda personal:", error);
     return res.status(500).json({ status: "error", message: "Error interno del servidor", error: error.message });
   } finally {
     if (conn) conn.release();
