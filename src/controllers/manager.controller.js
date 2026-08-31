@@ -87,6 +87,26 @@ const bulkInsertChecklistItems = async (conn, db, rows) => {
   }
 };
 
+// Actualiza el status de tareas/subtareas ya existentes (reimport del mismo
+// backlog con estados nuevos), en bloques de IMPORT_CHUNK_SIZE por statement.
+const bulkUpdateTaskStatus = async (conn, db, updates) => {
+  for (const batch of chunkArray(updates, IMPORT_CHUNK_SIZE)) {
+    const whenClauses = batch.map(() => "WHEN ? THEN ?").join(" ");
+    const caseValues = batch.flatMap((u) => [u.id, u.status]);
+    const ids = batch.map((u) => u.id);
+    const placeholders = ids.map(() => "?").join(",");
+
+    await conn.query(
+      `UPDATE ${db}.tasks SET status = CASE id ${whenClauses} END WHERE id IN (${placeholders})`,
+      [...caseValues, ...ids]
+    );
+  }
+};
+
+// Padre expresado como "[ID] Título" (formato del backlog de seguimiento de
+// HUs exportado a Excel) — captura el código y el título sin el prefijo.
+const PARENT_WITH_CODE_REGEX = /^\[([^\]]+)\]\s*(.*)$/;
+
 // Nombre de la tabla unificada
 const TABLE = "example";
 
@@ -408,58 +428,130 @@ projectManagerRouter.post("/:project_id/import-tasks", async (req, res) => {
     const rootRows = rows.filter((r) => r.tipo !== "Subtask" && r.titulo && r.titulo.trim());
     const subtaskRows = rows.filter((r) => r.tipo === "Subtask" && r.titulo && r.titulo.trim());
 
-    // 1) Bulk insert de tareas raíz.
-    const rootInsertRows = rootRows.map((row) => [
+    // 1) Tareas raíz: las que ya existen en el proyecto (mismo título) se
+    // actualizan de estado; solo se insertan las que son nuevas. Así un
+    // reimport del mismo backlog no duplica tareas, solo refresca su status.
+    const [existingRootRows] = await conn.query(
+      `SELECT id, title FROM ${db}.tasks WHERE project_id = ? AND parent_id IS NULL`,
+      [project_id]
+    );
+    const existingRootIdByTitle = {};
+    existingRootRows.forEach((t) => {
+      existingRootIdByTitle[t.title.trim()] = t.id;
+    });
+
+    const titleToId = {};
+    const idCodeToId = {}; // ID de la fila en el Excel -> id en BD (nueva o existente)
+    const rootToInsert = [];
+    const rootToUpdate = [];
+
+    rootRows.forEach((row) => {
+      const title = row.titulo.trim();
+      const status = normalizeImportStatus(row.status);
+      const existingId = existingRootIdByTitle[title];
+
+      if (existingId) {
+        rootToUpdate.push({ id: existingId, status });
+        titleToId[title] = existingId;
+        if (row.id) idCodeToId[String(row.id).trim()] = existingId;
+      } else {
+        rootToInsert.push({ ...row, title, status });
+      }
+    });
+
+    const rootInsertRows = rootToInsert.map((row) => [
       project_id,
-      row.titulo.trim(),
+      row.title,
       row.descripcion || "",
-      normalizeImportStatus(row.status),
+      row.status,
       null,
       row.tags || null,
       created_by || null,
     ]);
-    const rootIds = await bulkInsertTasks(conn, db, rootInsertRows);
+    const newRootIds = await bulkInsertTasks(conn, db, rootInsertRows);
 
-    const titleToId = {};
-    rootRows.forEach((row, idx) => {
-      titleToId[row.titulo.trim()] = rootIds[idx];
+    rootToInsert.forEach((row, idx) => {
+      titleToId[row.title] = newRootIds[idx];
+      if (row.id) idCodeToId[String(row.id).trim()] = newRootIds[idx];
     });
 
-    // 2) Resolver padres y bulk insert de subtareas (se omiten las que no matchean título de padre).
+    if (rootToUpdate.length > 0) {
+      await bulkUpdateTaskStatus(conn, db, rootToUpdate);
+    }
+
+    // 2) Subtareas ya existentes bajo cualquier padre de este proyecto (para
+    // el mismo upsert por (padre, título) que las tareas raíz).
+    const [existingSubtaskRows] = await conn.query(
+      `SELECT id, parent_id, title FROM ${db}.tasks WHERE project_id = ? AND parent_id IS NOT NULL`,
+      [project_id]
+    );
+    const existingSubtaskIdByKey = {};
+    existingSubtaskRows.forEach((t) => {
+      existingSubtaskIdByKey[`${t.parent_id}::${t.title.trim()}`] = t.id;
+    });
+
+    // Resolver padres: el Padre puede venir como "[ID] Título" (backlog de
+    // seguimiento de HUs) o como título exacto (plantilla plana original).
+    // Se omiten las subtareas que no matchean ningún padre.
     const resolvedSubtaskRows = subtaskRows
       .map((row) => {
         const cleanTitle = cleanSubtaskTitle(row.titulo);
-        const parentTitle = row.padre ? row.padre.trim() : null;
-        const parentId = parentTitle ? titleToId[parentTitle] : null;
+        const rawPadre = row.padre ? row.padre.trim() : null;
+        if (!rawPadre) return null;
+
+        const codeMatch = rawPadre.match(PARENT_WITH_CODE_REGEX);
+        const parentId = codeMatch
+          ? idCodeToId[codeMatch[1].trim()] || titleToId[codeMatch[2].trim()]
+          : titleToId[rawPadre];
         if (!parentId) return null;
+
         const tag = row.tags || extractTagFromTitle(cleanTitle);
-        return { ...row, cleanTitle, parentId, tag };
+        const status = normalizeImportStatus(row.status);
+        return { ...row, cleanTitle, parentId, tag, status };
       })
       .filter(Boolean);
 
-    const subtaskInsertRows = resolvedSubtaskRows.map((row) => [
+    const subtaskToInsert = [];
+    const subtaskToUpdate = [];
+
+    resolvedSubtaskRows.forEach((row) => {
+      const existingId = existingSubtaskIdByKey[`${row.parentId}::${row.cleanTitle}`];
+      if (existingId) {
+        subtaskToUpdate.push({ id: existingId, status: row.status });
+      } else {
+        subtaskToInsert.push(row);
+      }
+    });
+
+    const subtaskInsertRows = subtaskToInsert.map((row) => [
       project_id,
       row.cleanTitle,
       row.descripcion || "",
-      normalizeImportStatus(row.status),
+      row.status,
       row.parentId,
       row.tag,
       created_by || null,
     ]);
-    const subtaskIds = await bulkInsertTasks(conn, db, subtaskInsertRows);
+    const newSubtaskIds = await bulkInsertTasks(conn, db, subtaskInsertRows);
 
-    // 3) Bulk insert del checklist (bullets de "Criterios de Aceptación") de tareas y subtareas.
+    if (subtaskToUpdate.length > 0) {
+      await bulkUpdateTaskStatus(conn, db, subtaskToUpdate);
+    }
+
+    // 3) Bulk insert del checklist (bullets de "Criterios de Aceptación") solo
+    // para tareas/subtareas nuevas: las que ya existían conservan su
+    // checklist tal cual (marcado manualmente), no se vuelve a poblar.
     const checklistInsertRows = [];
 
-    rootRows.forEach((row, idx) => {
+    rootToInsert.forEach((row, idx) => {
       extractChecklistItems(row.descripcion).forEach((label, i) => {
-        checklistInsertRows.push([rootIds[idx], label, i]);
+        checklistInsertRows.push([newRootIds[idx], label, i]);
       });
     });
 
-    resolvedSubtaskRows.forEach((row, idx) => {
+    subtaskToInsert.forEach((row, idx) => {
       extractChecklistItems(row.descripcion).forEach((label, i) => {
-        checklistInsertRows.push([subtaskIds[idx], label, i]);
+        checklistInsertRows.push([newSubtaskIds[idx], label, i]);
       });
     });
 
@@ -467,8 +559,10 @@ projectManagerRouter.post("/:project_id/import-tasks", async (req, res) => {
       await bulkInsertChecklistItems(conn, db, checklistInsertRows);
     }
 
-    const tasksCreated = rootRows.length;
-    const subtasksCreated = resolvedSubtaskRows.length;
+    const tasksCreated = rootToInsert.length;
+    const subtasksCreated = subtaskToInsert.length;
+    const tasksUpdated = rootToUpdate.length;
+    const subtasksUpdated = subtaskToUpdate.length;
     const checklistItemsCreated = checklistInsertRows.length;
 
     await conn.commit();
@@ -480,6 +574,10 @@ projectManagerRouter.post("/:project_id/import-tasks", async (req, res) => {
         tasks: tasksCreated,
         subtasks: subtasksCreated,
         checklist_items: checklistItemsCreated
+      },
+      updated: {
+        tasks: tasksUpdated,
+        subtasks: subtasksUpdated
       }
     });
 
