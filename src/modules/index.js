@@ -14,8 +14,10 @@ import { personalFinanceRouter } from "../controllers/personal-finance.controlle
 import { notificationsRouter } from "../controllers/notifications.controller.js";
 import { usersRouter } from "../controllers/user.controller.js";
 import { pricesRouter } from "../controllers/prices-project.controller.js";
+import { vscodeIntegrationRouter } from "../controllers/vscode-integration.controller.js";
 import { authMiddleware } from "../middlewares/auth.middleware.js";
 import { requireAdmin } from "../middlewares/require-admin.middleware.js";
+import { AuthorizationVerify } from "../middlewares/authorization.js";
 
 
 const router = Router();
@@ -38,6 +40,7 @@ router.use("/checklist", authMiddleware, checklistRouter);
 router.use("/gerencia", authMiddleware, requireAdmin, gerenciaRouter);
 router.use("/personal", authMiddleware, personalFinanceRouter);
 router.use("/notifications", authMiddleware, notificationsRouter);
+router.use("/vscode", AuthorizationVerify, vscodeIntegrationRouter);
 router.use("/user", usersRouter);
 router.use("/prices", pricesRouter);
 
