@@ -428,40 +428,56 @@ projectManagerRouter.post("/:project_id/import-tasks", async (req, res) => {
     const rootRows = rows.filter((r) => r.tipo !== "Subtask" && r.titulo && r.titulo.trim());
     const subtaskRows = rows.filter((r) => r.tipo === "Subtask" && r.titulo && r.titulo.trim());
 
-    // 1) Tareas raíz: las que ya existen en el proyecto (mismo título) se
-    // actualizan de estado; solo se insertan las que son nuevas. Así un
-    // reimport del mismo backlog no duplica tareas, solo refresca su status.
+    // 1) Tareas raíz: las que ya existen en el proyecto se actualizan de
+    // estado; solo se insertan las que son nuevas. Así un reimport del mismo
+    // backlog no duplica tareas, solo refresca su status. El match primario
+    // es por el código [ID] (más robusto que el título: las tareas ya
+    // importadas antes lo llevan incrustado al inicio del título, ej.
+    // "[0015] Account lockout for failed attempts"); si una fila no trae ID
+    // o no matchea por código, cae a comparar título exacto (con o sin ese
+    // prefijo) como respaldo.
+    const LEADING_CODE_REGEX = /^\[([^\]]+)\]\s*/;
+
     const [existingRootRows] = await conn.query(
       `SELECT id, title FROM ${db}.tasks WHERE project_id = ? AND parent_id IS NULL`,
       [project_id]
     );
     const existingRootIdByTitle = {};
+    const idCodeToId = {}; // ID de la fila en el Excel -> id en BD (existente o nueva)
     existingRootRows.forEach((t) => {
-      existingRootIdByTitle[t.title.trim()] = t.id;
+      const rawTitle = t.title.trim();
+      existingRootIdByTitle[rawTitle] = t.id;
+      const codeMatch = rawTitle.match(LEADING_CODE_REGEX);
+      if (codeMatch) {
+        idCodeToId[codeMatch[1].trim()] = t.id;
+        existingRootIdByTitle[rawTitle.replace(LEADING_CODE_REGEX, "").trim()] = t.id;
+      }
     });
 
     const titleToId = {};
-    const idCodeToId = {}; // ID de la fila en el Excel -> id en BD (nueva o existente)
     const rootToInsert = [];
     const rootToUpdate = [];
 
     rootRows.forEach((row) => {
       const title = row.titulo.trim();
       const status = normalizeImportStatus(row.status);
-      const existingId = existingRootIdByTitle[title];
+      const code = row.id ? String(row.id).trim() : null;
+      const existingId = (code && idCodeToId[code]) || existingRootIdByTitle[title];
 
       if (existingId) {
         rootToUpdate.push({ id: existingId, status });
         titleToId[title] = existingId;
-        if (row.id) idCodeToId[String(row.id).trim()] = existingId;
+        if (code) idCodeToId[code] = existingId;
       } else {
-        rootToInsert.push({ ...row, title, status });
+        // Se mantiene la convención "[ID] Título" del backlog original para que
+        // las tareas nuevas queden visualmente consistentes con las existentes.
+        rootToInsert.push({ ...row, title, insertTitle: code ? `[${code}] ${title}` : title, status, code });
       }
     });
 
     const rootInsertRows = rootToInsert.map((row) => [
       project_id,
-      row.title,
+      row.insertTitle,
       row.descripcion || "",
       row.status,
       null,
@@ -472,22 +488,29 @@ projectManagerRouter.post("/:project_id/import-tasks", async (req, res) => {
 
     rootToInsert.forEach((row, idx) => {
       titleToId[row.title] = newRootIds[idx];
-      if (row.id) idCodeToId[String(row.id).trim()] = newRootIds[idx];
+      if (row.code) idCodeToId[row.code] = newRootIds[idx];
     });
 
     if (rootToUpdate.length > 0) {
       await bulkUpdateTaskStatus(conn, db, rootToUpdate);
     }
 
-    // 2) Subtareas ya existentes bajo cualquier padre de este proyecto (para
-    // el mismo upsert por (padre, título) que las tareas raíz).
+    // 2) Subtareas ya existentes bajo cualquier padre de este proyecto (mismo
+    // upsert por código [ID] con respaldo por (padre, título) exacto).
     const [existingSubtaskRows] = await conn.query(
       `SELECT id, parent_id, title FROM ${db}.tasks WHERE project_id = ? AND parent_id IS NOT NULL`,
       [project_id]
     );
     const existingSubtaskIdByKey = {};
+    const subtaskCodeToId = {};
     existingSubtaskRows.forEach((t) => {
-      existingSubtaskIdByKey[`${t.parent_id}::${t.title.trim()}`] = t.id;
+      const rawTitle = t.title.trim();
+      existingSubtaskIdByKey[`${t.parent_id}::${rawTitle}`] = t.id;
+      const codeMatch = rawTitle.match(LEADING_CODE_REGEX);
+      if (codeMatch) {
+        subtaskCodeToId[codeMatch[1].trim()] = t.id;
+        existingSubtaskIdByKey[`${t.parent_id}::${rawTitle.replace(LEADING_CODE_REGEX, "").trim()}`] = t.id;
+      }
     });
 
     // Resolver padres: el Padre puede venir como "[ID] Título" (backlog de
@@ -515,17 +538,20 @@ projectManagerRouter.post("/:project_id/import-tasks", async (req, res) => {
     const subtaskToUpdate = [];
 
     resolvedSubtaskRows.forEach((row) => {
-      const existingId = existingSubtaskIdByKey[`${row.parentId}::${row.cleanTitle}`];
+      const code = row.id ? String(row.id).trim() : null;
+      const existingId =
+        (code && subtaskCodeToId[code]) || existingSubtaskIdByKey[`${row.parentId}::${row.cleanTitle}`];
       if (existingId) {
         subtaskToUpdate.push({ id: existingId, status: row.status });
       } else {
+        row.insertTitle = code ? `[${code}] ${row.cleanTitle}` : row.cleanTitle;
         subtaskToInsert.push(row);
       }
     });
 
     const subtaskInsertRows = subtaskToInsert.map((row) => [
       project_id,
-      row.cleanTitle,
+      row.insertTitle,
       row.descripcion || "",
       row.status,
       row.parentId,
