@@ -306,16 +306,29 @@ projectManagerRouter.get("/partners/:project_id", async (req, res) => {
     // (GET /task/:id) cuando se abre el detalle.
     const DESCRIPTION_PREVIEW_LENGTH = 300;
 
+    // Metadata del catálogo ERP (módulo/épica/rol/caso de uso/prioridad/release/
+    // puntos/código externo): liviana por fila, se manda siempre en el listado
+    // del tablero para poder armar badges y la vista jerárquica sin otra
+    // llamada. Lo pesado (criterios de aceptación, reglas de negocio, notas UX)
+    // se trae aparte en GET /task/:id, igual que ya pasa con description.
     const rootQuery = `
         SELECT t.id, t.project_id, t.parent_id, t.title,
         LEFT(t.description, ${DESCRIPTION_PREVIEW_LENGTH}) as description,
         (CHAR_LENGTH(t.description) > ${DESCRIPTION_PREVIEW_LENGTH}) as description_truncated,
-        t.tags, t.due_date, t.created_by, u.name as assigned_to, creator.name as created_by_name, t.status
+        t.tags, t.due_date, t.created_by, u.name as assigned_to, creator.name as created_by_name, t.status,
+        t.external_code, t.priority, t.release_tag, t.story_points,
+        tm.code as module_code, tm.name as module_name,
+        te.name as epic_name, tr.name as role_name,
+        tuc.code as use_case_code, tuc.name as use_case_name
         FROM ${db}.tasks t
         LEFT JOIN ${db}.users u
         ON t.assigned_to = u.id
         LEFT JOIN ${db}.users creator
         ON t.created_by = creator.id
+        LEFT JOIN ${db}.task_modules tm ON t.module_id = tm.id
+        LEFT JOIN ${db}.task_epics te ON t.epic_id = te.id
+        LEFT JOIN ${db}.task_roles tr ON t.role_id = tr.id
+        LEFT JOIN ${db}.task_use_cases tuc ON t.use_case_id = tuc.id
         WHERE t.project_id = ? AND t.parent_id IS NULL
         ORDER BY t.id ASC
         `;
@@ -333,12 +346,20 @@ projectManagerRouter.get("/partners/:project_id", async (req, res) => {
         SELECT t.id, t.project_id, t.parent_id, t.title,
         LEFT(t.description, ${DESCRIPTION_PREVIEW_LENGTH}) as description,
         (CHAR_LENGTH(t.description) > ${DESCRIPTION_PREVIEW_LENGTH}) as description_truncated,
-        t.tags, t.due_date, t.created_by, u.name as assigned_to, creator.name as created_by_name, t.status
+        t.tags, t.due_date, t.created_by, u.name as assigned_to, creator.name as created_by_name, t.status,
+        t.external_code, t.priority, t.release_tag, t.story_points,
+        tm.code as module_code, tm.name as module_name,
+        te.name as epic_name, tr.name as role_name,
+        tuc.code as use_case_code, tuc.name as use_case_name
         FROM ${db}.tasks t
         LEFT JOIN ${db}.users u
         ON t.assigned_to = u.id
         LEFT JOIN ${db}.users creator
         ON t.created_by = creator.id
+        LEFT JOIN ${db}.task_modules tm ON t.module_id = tm.id
+        LEFT JOIN ${db}.task_epics te ON t.epic_id = te.id
+        LEFT JOIN ${db}.task_roles tr ON t.role_id = tr.id
+        LEFT JOIN ${db}.task_use_cases tuc ON t.use_case_id = tuc.id
         WHERE t.project_id = ? AND t.parent_id IS NOT NULL
         ORDER BY t.id ASC
         `;
@@ -610,6 +631,343 @@ projectManagerRouter.post("/:project_id/import-tasks", async (req, res) => {
   } catch (error) {
     if (conn) await conn.rollback();
     logger.error("Error importando tareas:", error);
+
+    return res.status(500).json({
+      status: "error",
+      message: "Error interno del servidor",
+      error: error.message
+    });
+
+  } finally {
+    if (conn) conn.release();
+  }
+});
+
+// ======================== POST importar catálogo ERP (Módulos/Roles/Casos de Uso/Épicas/HUs/Criterios) ========================
+// Importador dedicado al formato "ERP EDEN" (workbook con hojas Historias de
+// Usuario + Criterios de aceptación + Módulos + Casos de Uso + Roles), distinto
+// del importador plano/agrupado de /import-tasks: acá cada Historia de Usuario
+// se enlaza a un módulo, una épica, un rol y (opcionalmente) un caso de uso como
+// catálogo relacional propio del proyecto, y sus criterios de aceptación quedan
+// en filas propias (Dado/Cuando/Entonces) en vez de bullets en la descripción.
+// El parseo del .xlsx ocurre en el frontend (import-tasks-modal); acá solo se
+// persiste lo ya estructurado.
+const VALID_PRIORITIES = new Set(["Must", "Should", "Could"]);
+
+const upsertModules = async (conn, db, projectId, modules) => {
+  for (const m of modules) {
+    if (!m.code) continue;
+    await conn.query(
+      `INSERT INTO ${db}.task_modules (project_id, code, name, grupo, descripcion, objetivo, release_base)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE name = VALUES(name), grupo = VALUES(grupo), descripcion = VALUES(descripcion),
+         objetivo = VALUES(objetivo), release_base = VALUES(release_base)`,
+      [projectId, m.code, m.name || m.code, m.grupo || null, m.descripcion || null, m.objetivo || null, m.release_base || null]
+    );
+  }
+
+  const [rows] = await conn.query(`SELECT id, code FROM ${db}.task_modules WHERE project_id = ?`, [projectId]);
+  const byCode = {};
+  rows.forEach((r) => (byCode[r.code] = r.id));
+  return byCode;
+};
+
+const upsertRoles = async (conn, db, projectId, roles) => {
+  for (const r of roles) {
+    if (!r.name) continue;
+    await conn.query(
+      `INSERT INTO ${db}.task_roles (project_id, name, tipo, descripcion)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE tipo = VALUES(tipo), descripcion = VALUES(descripcion)`,
+      [projectId, r.name, r.tipo || null, r.descripcion || null]
+    );
+  }
+
+  const [rows] = await conn.query(`SELECT id, name FROM ${db}.task_roles WHERE project_id = ?`, [projectId]);
+  const byName = {};
+  rows.forEach((r) => (byName[r.name] = r.id));
+  return byName;
+};
+
+const upsertUseCases = async (conn, db, projectId, useCases, moduleByCode) => {
+  for (const uc of useCases) {
+    if (!uc.code) continue;
+    const moduleId = uc.module_code ? moduleByCode[uc.module_code] || null : null;
+    await conn.query(
+      `INSERT INTO ${db}.task_use_cases (project_id, module_id, code, name, actor_principal, actores_secundarios, objetivo, release_minimo)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE module_id = VALUES(module_id), name = VALUES(name), actor_principal = VALUES(actor_principal),
+         actores_secundarios = VALUES(actores_secundarios), objetivo = VALUES(objetivo), release_minimo = VALUES(release_minimo)`,
+      [projectId, moduleId, uc.code, uc.name || uc.code, uc.actor_principal || null, uc.actores_secundarios || null, uc.objetivo || null, uc.release_minimo || null]
+    );
+  }
+
+  const [rows] = await conn.query(`SELECT id, code FROM ${db}.task_use_cases WHERE project_id = ?`, [projectId]);
+  const byCode = {};
+  rows.forEach((r) => (byCode[r.code] = r.id));
+  return byCode;
+};
+
+const upsertEpics = async (conn, db, projectId, epicsList, moduleByCode) => {
+  for (const e of epicsList) {
+    const moduleId = moduleByCode[e.module_code];
+    if (!moduleId || !e.name) continue;
+
+    await conn.query(
+      `INSERT INTO ${db}.task_epics (project_id, module_id, name) VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE name = VALUES(name)`,
+      [projectId, moduleId, e.name]
+    );
+  }
+
+  const [rows] = await conn.query(
+    `SELECT te.id, te.name, tm.code as module_code FROM ${db}.task_epics te
+     JOIN ${db}.task_modules tm ON tm.id = te.module_id WHERE te.project_id = ?`,
+    [projectId]
+  );
+  const byKey = {};
+  rows.forEach((r) => (byKey[`${r.module_code}::${r.name}`] = r.id));
+  return byKey;
+};
+
+// 19 columnas de tasks (mismo truco de ids contiguos que bulkInsertTasks):
+// assigned_to y parent_id no aplican a historias importadas (sin colaborador,
+// sin jerarquía por parent_id — la jerarquía acá es módulo/épica).
+const bulkInsertErpTasks = async (conn, db, rows) => {
+  const ids = [];
+
+  for (const batch of chunkArray(rows, IMPORT_CHUNK_SIZE)) {
+    const placeholders = batch
+      .map(() => "(?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .join(", ");
+    const values = batch.flat();
+
+    const [result] = await conn.query(
+      `INSERT INTO ${db}.tasks
+        (project_id, title, description, assigned_to, status, parent_id, tags, created_by,
+         module_id, epic_id, role_id, use_case_id, priority, release_tag, story_points,
+         external_code, business_rules, ux_notes, dependencies_raw)
+       VALUES ${placeholders}`,
+      values
+    );
+
+    for (let i = 0; i < batch.length; i++) ids.push(result.insertId + i);
+  }
+
+  return ids;
+};
+
+projectManagerRouter.post("/:project_id/import-erp-catalog", async (req, res) => {
+  const { project_id } = req.params;
+  const { created_by, modules = [], roles = [], useCases = [], epics = [], stories = [] } = req.body;
+
+  if (!project_id) {
+    return res.status(400).json({ status: "error", message: "El ID del proyecto es requerido" });
+  }
+
+  if (!Array.isArray(stories) || stories.length === 0) {
+    return res.status(400).json({
+      status: "error",
+      message: "Se requiere un array 'stories' con al menos una historia de usuario"
+    });
+  }
+
+  let conn;
+
+  try {
+    conn = await getConnection();
+    const db = env.db.database;
+
+    await conn.beginTransaction();
+
+    const moduleByCode = await upsertModules(conn, db, project_id, modules);
+    const roleByName = await upsertRoles(conn, db, project_id, roles);
+    const useCaseByCode = await upsertUseCases(conn, db, project_id, useCases, moduleByCode);
+
+    // Módulos/roles/casos de uso referenciados por alguna historia pero
+    // ausentes de sus catálogos (ej. se excluyó la hoja "Roles" al importar):
+    // se crean versiones mínimas para no perder el enlace.
+    const missingModuleCodes = new Set();
+    const missingRoleNames = new Set();
+    const missingUseCaseCodes = new Set();
+
+    stories.forEach((s) => {
+      if (s.module_code && !moduleByCode[s.module_code]) missingModuleCodes.add(s.module_code);
+      if (s.role_name && !roleByName[s.role_name]) missingRoleNames.add(s.role_name);
+      if (s.use_case_code && !useCaseByCode[s.use_case_code]) missingUseCaseCodes.add(s.use_case_code);
+    });
+
+    if (missingModuleCodes.size > 0) {
+      const extra = await upsertModules(
+        conn, db, project_id,
+        [...missingModuleCodes].map((code) => ({ code, name: code }))
+      );
+      Object.assign(moduleByCode, extra);
+    }
+    if (missingRoleNames.size > 0) {
+      const extra = await upsertRoles(
+        conn, db, project_id,
+        [...missingRoleNames].map((name) => ({ name }))
+      );
+      Object.assign(roleByName, extra);
+    }
+    if (missingUseCaseCodes.size > 0) {
+      const extra = await upsertUseCases(
+        conn, db, project_id,
+        [...missingUseCaseCodes].map((code) => ({ code, name: code })),
+        moduleByCode
+      );
+      Object.assign(useCaseByCode, extra);
+    }
+
+    // Épicas declaradas explícitamente + cualquier (módulo, épica) que traiga
+    // una historia y no esté en la lista (mismo criterio de auto-creación).
+    const epicKeys = new Set(epics.map((e) => `${e.module_code}::${e.name}`));
+    const allEpics = [...epics];
+    stories.forEach((s) => {
+      if (s.module_code && s.epic_name) {
+        const key = `${s.module_code}::${s.epic_name}`;
+        if (!epicKeys.has(key)) {
+          epicKeys.add(key);
+          allEpics.push({ module_code: s.module_code, name: s.epic_name });
+        }
+      }
+    });
+    const epicByKey = await upsertEpics(conn, db, project_id, allEpics, moduleByCode);
+
+    // Upsert de historias: match por (project_id, external_code). Igual que en
+    // /import-tasks, reimportar el mismo backlog actualiza en vez de duplicar.
+    const [existingRows] = await conn.query(
+      `SELECT id, external_code FROM ${db}.tasks WHERE project_id = ? AND external_code IS NOT NULL`,
+      [project_id]
+    );
+    const existingIdByCode = {};
+    existingRows.forEach((r) => (existingIdByCode[r.external_code] = r.id));
+
+    const toInsert = [];
+    const toUpdate = [];
+
+    stories.forEach((s) => {
+      if (!s.title || !s.title.trim()) return;
+
+      const resolved = {
+        ...s,
+        title: s.title.trim(),
+        moduleId: s.module_code ? moduleByCode[s.module_code] || null : null,
+        epicId: s.module_code && s.epic_name ? epicByKey[`${s.module_code}::${s.epic_name}`] || null : null,
+        roleId: s.role_name ? roleByName[s.role_name] || null : null,
+        useCaseId: s.use_case_code ? useCaseByCode[s.use_case_code] || null : null,
+        priority: VALID_PRIORITIES.has(s.priority) ? s.priority : null,
+        status: normalizeImportStatus(s.status),
+        points: s.story_points !== "" && s.story_points != null && Number.isFinite(Number(s.story_points))
+          ? Number(s.story_points)
+          : null,
+      };
+
+      const existingId = s.external_code ? existingIdByCode[s.external_code] : null;
+      if (existingId) {
+        toUpdate.push({ ...resolved, id: existingId });
+      } else {
+        toInsert.push(resolved);
+      }
+    });
+
+    const insertRows = toInsert.map((s) => [
+      project_id,
+      s.title,
+      s.story_text || "",
+      s.status,
+      s.tags || null,
+      created_by || null,
+      s.moduleId,
+      s.epicId,
+      s.roleId,
+      s.useCaseId,
+      s.priority,
+      s.release_tag || null,
+      s.points,
+      s.external_code || null,
+      s.business_rules || null,
+      s.ux_notes || null,
+      s.dependencies_raw || null,
+    ]);
+    const newIds = await bulkInsertErpTasks(conn, db, insertRows);
+    toInsert.forEach((s, idx) => (s.id = newIds[idx]));
+
+    for (const s of toUpdate) {
+      await conn.query(
+        `UPDATE ${db}.tasks SET title = ?, description = ?, status = ?, tags = ?,
+           module_id = ?, epic_id = ?, role_id = ?, use_case_id = ?, priority = ?,
+           release_tag = ?, story_points = ?, business_rules = ?, ux_notes = ?, dependencies_raw = ?
+         WHERE id = ?`,
+        [
+          s.title, s.story_text || "", s.status, s.tags || null,
+          s.moduleId, s.epicId, s.roleId, s.useCaseId, s.priority,
+          s.release_tag || null, s.points, s.business_rules || null, s.ux_notes || null, s.dependencies_raw || null,
+          s.id,
+        ]
+      );
+    }
+
+    // Criterios de aceptación: se refrescan por completo para las historias
+    // tocadas en este import (nuevas o actualizadas), así un reimport siempre
+    // deja los criterios exactamente como en la hoja.
+    const allStoryRows = [...toInsert, ...toUpdate];
+    const touchedIds = allStoryRows.map((s) => s.id);
+
+    if (touchedIds.length > 0) {
+      for (const idBatch of chunkArray(touchedIds, IMPORT_CHUNK_SIZE)) {
+        const placeholders = idBatch.map(() => "?").join(",");
+        await conn.query(
+          `DELETE FROM ${db}.task_acceptance_criteria WHERE task_id IN (${placeholders})`,
+          idBatch
+        );
+      }
+    }
+
+    const criteriaRows = [];
+    allStoryRows.forEach((s) => {
+      (s.criteria || []).forEach((c, i) => {
+        criteriaRows.push([
+          s.id, c.code || null, c.dado || null, c.cuando || null,
+          c.entonces || null, c.texto_completo || null, c.resultado_prueba || null, i,
+        ]);
+      });
+    });
+
+    if (criteriaRows.length > 0) {
+      for (const batch of chunkArray(criteriaRows, IMPORT_CHUNK_SIZE)) {
+        const placeholders = batch.map(() => "(?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
+        await conn.query(
+          `INSERT INTO ${db}.task_acceptance_criteria
+            (task_id, code, dado, cuando, entonces, texto_completo, resultado_prueba, position)
+           VALUES ${placeholders}`,
+          batch.flat()
+        );
+      }
+    }
+
+    await conn.commit();
+
+    return res.status(201).json({
+      status: "ok",
+      message: "Importación del catálogo ERP completada con éxito",
+      created: {
+        modules: Object.keys(moduleByCode).length,
+        roles: Object.keys(roleByName).length,
+        use_cases: Object.keys(useCaseByCode).length,
+        epics: Object.keys(epicByKey).length,
+        tasks: toInsert.length,
+        criteria: criteriaRows.length
+      },
+      updated: {
+        tasks: toUpdate.length
+      }
+    });
+
+  } catch (error) {
+    if (conn) await conn.rollback();
+    logger.error("Error importando catálogo ERP:", error);
 
     return res.status(500).json({
       status: "error",
