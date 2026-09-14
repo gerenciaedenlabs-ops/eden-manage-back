@@ -2,6 +2,7 @@ import { Router } from "express";
 import { getConnection } from "../database/connection.js";
 import { logger } from "../config/logger.js";
 import { env } from "../config/env.js";
+import { githubApiRequest } from "../utils/github-app.js";
 
 export const projectManagerRouter = Router();
 
@@ -968,6 +969,171 @@ projectManagerRouter.post("/:project_id/import-erp-catalog", async (req, res) =>
   } catch (error) {
     if (conn) await conn.rollback();
     logger.error("Error importando catálogo ERP:", error);
+
+    return res.status(500).json({
+      status: "error",
+      message: "Error interno del servidor",
+      error: error.message
+    });
+
+  } finally {
+    if (conn) conn.release();
+  }
+});
+
+// ======================== GET repositorios vinculados a un proyecto ========================
+projectManagerRouter.get("/:project_id/repositories", async (req, res) => {
+  const { project_id } = req.params;
+  let conn;
+
+  try {
+    conn = await getConnection();
+    const db = env.db.database;
+
+    const [rows] = await conn.query(
+      `SELECT id, repo_full_name, repo_url, default_branch, is_private, created_at
+       FROM ${db}.project_repositories WHERE project_id = ? ORDER BY id ASC`,
+      [project_id]
+    );
+
+    return res.json({ status: "ok", data: rows });
+
+  } catch (error) {
+    logger.error("Error listando repositorios del proyecto:", error);
+
+    return res.status(500).json({
+      status: "error",
+      message: "Error interno del servidor",
+      error: error.message
+    });
+
+  } finally {
+    if (conn) conn.release();
+  }
+});
+
+// ======================== POST vincular repositorio existente ========================
+// Confirma contra la API de GitHub (no confía en el string suelto del
+// body): si la GitHub App no tiene acceso a ese repo, esto falla antes de
+// guardar nada en la base de datos.
+projectManagerRouter.post("/:project_id/repositories/link", async (req, res) => {
+  const { project_id } = req.params;
+  const { repo_full_name, created_by } = req.body;
+
+  if (!repo_full_name || !repo_full_name.includes("/")) {
+    return res.status(400).json({
+      status: "error",
+      message: "Se requiere repo_full_name en formato 'organización/repositorio'"
+    });
+  }
+
+  let conn;
+
+  try {
+    const repo = await githubApiRequest(`/repos/${repo_full_name}`);
+
+    conn = await getConnection();
+    const db = env.db.database;
+
+    await conn.query(
+      `INSERT INTO ${db}.project_repositories (project_id, repo_full_name, repo_url, default_branch, is_private, created_by)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [project_id, repo.full_name, repo.html_url, repo.default_branch, repo.private ? 1 : 0, created_by || null]
+    );
+
+    return res.status(201).json({ status: "ok", message: "Repositorio vinculado con éxito" });
+
+  } catch (error) {
+    if (error.status === 404) {
+      return res.status(404).json({
+        status: "error",
+        message: "La GitHub App no tiene acceso a ese repositorio (o no existe)"
+      });
+    }
+    if (error.code === "ER_DUP_ENTRY") {
+      return res.status(409).json({ status: "error", message: "Ese repositorio ya está vinculado a este proyecto" });
+    }
+
+    logger.error("Error vinculando repositorio:", error);
+
+    return res.status(500).json({
+      status: "error",
+      message: "Error interno del servidor",
+      error: error.message
+    });
+
+  } finally {
+    if (conn) conn.release();
+  }
+});
+
+// ======================== POST crear repositorio nuevo y vincularlo ========================
+projectManagerRouter.post("/:project_id/repositories/create", async (req, res) => {
+  const { project_id } = req.params;
+  const { name, description, isPrivate = true, created_by } = req.body;
+
+  if (!name || !name.trim()) {
+    return res.status(400).json({ status: "error", message: "Se requiere el nombre del repositorio" });
+  }
+
+  let conn;
+
+  try {
+    const repo = await githubApiRequest(`/orgs/${env.github.org}/repos`, {
+      method: "POST",
+      body: JSON.stringify({ name: name.trim(), description: description || "", private: !!isPrivate }),
+    });
+
+    conn = await getConnection();
+    const db = env.db.database;
+
+    await conn.query(
+      `INSERT INTO ${db}.project_repositories (project_id, repo_full_name, repo_url, default_branch, is_private, created_by)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [project_id, repo.full_name, repo.html_url, repo.default_branch, repo.private ? 1 : 0, created_by || null]
+    );
+
+    return res.status(201).json({
+      status: "ok",
+      message: "Repositorio creado y vinculado con éxito",
+      data: { url: repo.html_url, full_name: repo.full_name }
+    });
+
+  } catch (error) {
+    logger.error("Error creando repositorio en GitHub:", error);
+
+    return res.status(500).json({
+      status: "error",
+      message: "No se pudo crear el repositorio en GitHub",
+      error: error.message
+    });
+
+  } finally {
+    if (conn) conn.release();
+  }
+});
+
+// ======================== DELETE desvincular repositorio ========================
+// Solo borra la fila de asociación: nunca elimina el repositorio real en
+// GitHub (acción destructiva que esta ruta no debe poder disparar).
+projectManagerRouter.delete("/:project_id/repositories/:repo_id", async (req, res) => {
+  const { repo_id } = req.params;
+  let conn;
+
+  try {
+    conn = await getConnection();
+    const db = env.db.database;
+
+    const [result] = await conn.query(`DELETE FROM ${db}.project_repositories WHERE id = ?`, [repo_id]);
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ status: "error", message: "No se encontró el vínculo a eliminar" });
+    }
+
+    return res.json({ status: "ok", message: "Repositorio desvinculado (no se elimina de GitHub)" });
+
+  } catch (error) {
+    logger.error("Error desvinculando repositorio:", error);
 
     return res.status(500).json({
       status: "error",

@@ -18,4 +18,9 @@ export const env = {
         algorithm: process.env.JWT_ALGORITHM
     },
     apiKey: process.env.API_KEY,
+    github: {
+        appId: process.env.GITHUB_APP_ID,
+        privateKey: process.env.GITHUB_APP_PRIVATE_KEY,
+        org: process.env.GITHUB_ORG,
+    },
 };
