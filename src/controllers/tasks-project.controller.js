@@ -86,10 +86,18 @@ tasksRouter.get("/:id", async (req, res) => {
         const db = env.db.database;
 
         const [[task]] = await conn.query(
-            `SELECT t.id, t.project_id, t.parent_id, t.title, t.description, t.tags, t.due_date, t.created_by, u.name as assigned_to, creator.name as created_by_name, t.status
+            `SELECT t.id, t.project_id, t.parent_id, t.title, t.description, t.tags, t.due_date, t.created_by, u.name as assigned_to, creator.name as created_by_name, t.status,
+             t.external_code, t.priority, t.release_tag, t.story_points, t.business_rules, t.ux_notes, t.dependencies_raw,
+             tm.code as module_code, tm.name as module_name,
+             te.name as epic_name, tr.name as role_name,
+             tuc.code as use_case_code, tuc.name as use_case_name
              FROM ${db}.tasks t
              LEFT JOIN ${db}.users u ON t.assigned_to = u.id
              LEFT JOIN ${db}.users creator ON t.created_by = creator.id
+             LEFT JOIN ${db}.task_modules tm ON t.module_id = tm.id
+             LEFT JOIN ${db}.task_epics te ON t.epic_id = te.id
+             LEFT JOIN ${db}.task_roles tr ON t.role_id = tr.id
+             LEFT JOIN ${db}.task_use_cases tuc ON t.use_case_id = tuc.id
              WHERE t.id = ?`,
             [id]
         );
@@ -97,6 +105,15 @@ tasksRouter.get("/:id", async (req, res) => {
         if (!task) {
             return res.status(404).json({ status: "error", message: "Tarea no encontrada" });
         }
+
+        // Criterios de aceptación (Dado/Cuando/Entonces) solo aplican a historias
+        // importadas del catálogo ERP; para cualquier otra tarea queda [].
+        const [acceptanceCriteria] = await conn.query(
+            `SELECT id, code, dado, cuando, entonces, texto_completo, resultado_prueba
+             FROM ${db}.task_acceptance_criteria WHERE task_id = ? ORDER BY position ASC, id ASC`,
+            [id]
+        );
+        task.acceptance_criteria = acceptanceCriteria;
 
         const [subtasks] = await conn.query(
             `SELECT t.id, t.project_id, t.parent_id, t.title, t.description, t.tags, t.due_date, t.created_by, u.name as assigned_to, creator.name as created_by_name, t.status
