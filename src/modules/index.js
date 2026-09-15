@@ -35,7 +35,7 @@ router.use("/health-mysql", healthMySQLRouter);
 
 router.use("/idea", ideaRouter);
 router.use("/auth", authUserRouter);
-router.use("/project", projectManagerRouter);
+router.use("/project", authMiddleware, projectManagerRouter);
 router.use("/task", authMiddleware, tasksRouter);
 router.use("/checklist", authMiddleware, checklistRouter);
 router.use("/gerencia", authMiddleware, requireAdmin, gerenciaRouter);

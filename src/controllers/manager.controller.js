@@ -3,6 +3,8 @@ import { getConnection } from "../database/connection.js";
 import { logger } from "../config/logger.js";
 import { env } from "../config/env.js";
 import { githubApiRequest } from "../utils/github-app.js";
+import { isAdminUser } from "../utils/permissions.js";
+import { requireAdmin } from "../middlewares/require-admin.middleware.js";
 
 export const projectManagerRouter = Router();
 
@@ -58,15 +60,18 @@ const normalizeImportStatus = (status) => (VALID_IMPORT_STATUSES.has(status) ? s
 // Inserta tareas/subtareas en bloques de IMPORT_CHUNK_SIZE filas por statement.
 // Los ids se derivan de result.insertId + índice: en un INSERT multi-fila simple,
 // MySQL siempre reserva ids AUTO_INCREMENT contiguos para ese statement.
+// assigned_to/due_date son bound params (no NULL fijo): la plantilla "cronograma"
+// (ver import-tasks-modal.jsx) sí los manda al emparejar Responsable/Fecha con un
+// colaborador real; el resto de plantillas simplemente los deja en null.
 const bulkInsertTasks = async (conn, db, rows) => {
   const ids = [];
 
   for (const batch of chunkArray(rows, IMPORT_CHUNK_SIZE)) {
-    const placeholders = batch.map(() => "(?, ?, ?, NULL, ?, ?, ?, ?)").join(", ");
+    const placeholders = batch.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
     const values = batch.flat();
 
     const [result] = await conn.query(
-      `INSERT INTO ${db}.tasks (project_id, title, description, assigned_to, status, parent_id, tags, created_by) VALUES ${placeholders}`,
+      `INSERT INTO ${db}.tasks (project_id, title, description, assigned_to, status, parent_id, tags, due_date, created_by) VALUES ${placeholders}`,
       values
     );
 
@@ -152,34 +157,40 @@ projectManagerRouter.get("/project-type", async (req, res) => {
 });
 
 // ======================== GET proyectos freelance ========================
+// Mismo criterio que /project-active: admin ve todos los de type_id=2, el
+// resto solo los que tiene asignados en project_developers.
 projectManagerRouter.get("/project-freelance", async (req, res) => {
   let conn;
 
   try {
     conn = await getConnection();
     const db = env.db.database;
+    const admin = await isAdminUser(conn, db, req.user.id);
 
-    const query = `
+    const query = admin
+      ? `
         SELECT p.id, p.title, p.description, p.status,
           COALESCE(ROUND(SUM(t.status = 'completed') / NULLIF(COUNT(t.id), 0) * 100, 2), 0) as progress
         FROM ${db}.projects p
         LEFT JOIN ${db}.tasks t ON t.project_id = p.id
         WHERE p.type_id = 2
         GROUP BY p.id, p.title, p.description, p.status
+        `
+      : `
+        SELECT p.id, p.title, p.description, p.status,
+          COALESCE(ROUND(SUM(t.status = 'completed') / NULLIF(COUNT(t.id), 0) * 100, 2), 0) as progress
+        FROM ${db}.projects p
+        JOIN ${db}.project_developers pd ON pd.project_id = p.id AND pd.user_id = ?
+        LEFT JOIN ${db}.tasks t ON t.project_id = p.id
+        WHERE p.type_id = 2
+        GROUP BY p.id, p.title, p.description, p.status
         `;
 
-    const [rows] = await conn.query(query);
-
-    if (!rows || rows.length === 0) {
-      return res.status(404).json({
-        status: "error",
-        message: "No se encontraron registros"
-      });
-    }
+    const [rows] = await conn.query(query, admin ? [] : [req.user.id]);
 
     return res.json({
       status: "ok",
-      data: rows
+      data: rows || []
     });
 
   } catch (error) {
@@ -239,34 +250,43 @@ projectManagerRouter.post("/save-freelance", async (req, res) => {
 });
 
 // ======================== GET proyectos activos ========================
+// Un admin ve todos los proyectos activos; cualquier otro usuario solo ve
+// los que un admin le asignó explícitamente en project_developers (ver
+// GET/POST/DELETE /:project_id/developers más abajo).
 projectManagerRouter.get("/project-active", async (req, res) => {
   let conn;
 
   try {
     conn = await getConnection();
     const db = env.db.database;
+    const admin = await isAdminUser(conn, db, req.user.id);
 
-    const query = `
+    const query = admin
+      ? `
       SELECT p.id, p.title, p.description, p.status, p.type_id,
         COALESCE(ROUND(SUM(t.status = 'completed') / NULLIF(COUNT(t.id), 0) * 100, 2), 0) as progress
       FROM ${db}.projects p
       LEFT JOIN ${db}.tasks t ON t.project_id = p.id
       WHERE p.activate = 1
       GROUP BY p.id, p.title, p.description, p.status, p.type_id
+      `
+      : `
+      SELECT p.id, p.title, p.description, p.status, p.type_id,
+        COALESCE(ROUND(SUM(t.status = 'completed') / NULLIF(COUNT(t.id), 0) * 100, 2), 0) as progress
+      FROM ${db}.projects p
+      JOIN ${db}.project_developers pd ON pd.project_id = p.id AND pd.user_id = ?
+      LEFT JOIN ${db}.tasks t ON t.project_id = p.id
+      WHERE p.activate = 1
+      GROUP BY p.id, p.title, p.description, p.status, p.type_id
       `;
 
-    const [rows] = await conn.query(query);
+    const [rows] = await conn.query(query, admin ? [] : [req.user.id]);
 
-    if (!rows || rows.length === 0) {
-      return res.status(404).json({
-        status: "error",
-        message: "No se encontraron registros"
-      });
-    }
-
+    // Vacío es un resultado válido acá (ej. un desarrollador sin proyectos
+    // asignados todavía) — no es un error, así que no es 404.
     return res.json({
       status: "ok",
-      data: rows
+      data: rows || []
     });
 
   } catch (error) {
@@ -300,12 +320,44 @@ projectManagerRouter.get("/partners/:project_id", async (req, res) => {
     conn = await getConnection();
     const db = env.db.database;
 
+    // Acceso al proyecto: admin siempre; cualquier otro usuario solo si un
+    // admin lo asignó en project_developers (ver /:project_id/developers).
+    const admin = await isAdminUser(conn, db, req.user.id);
+
+    if (!admin) {
+      const [[access]] = await conn.query(
+        `SELECT 1 FROM ${db}.project_developers WHERE project_id = ? AND user_id = ? LIMIT 1`,
+        [project_id, req.user.id]
+      );
+      if (!access) {
+        return res.status(403).json({ status: "error", message: "No tienes acceso a este proyecto" });
+      }
+    }
+
     // La descripción va truncada en el listado del tablero: con cientos de
     // tareas, mandar el texto completo de cada una (criterios de aceptación
     // incluidos) puede pesar varios cientos de KB por carga, aunque la tarjeta
     // solo muestra una línea. El texto completo se trae aparte por tarea
     // (GET /task/:id) cuando se abre el detalle.
     const DESCRIPTION_PREVIEW_LENGTH = 300;
+
+    // Un no-admin (desarrollador) solo ve las tareas/subtareas que tiene
+    // asignadas específicamente (assigned_to), no todo el proyecto — aunque
+    // ya haya pasado el chequeo de acceso de arriba. Para las raíces, además
+    // de las asignadas a él directo, se incluyen las que son padre de alguna
+    // subtarea asignada a él (para no perder el contexto de esa subtarea) —
+    // sin eso, "HU sin asignar con una subtarea sí asignada a mí" desaparece
+    // por completo del tablero.
+    const rootAssignedFilter = admin
+      ? ""
+      : `AND (t.assigned_to = ? OR t.id IN (
+            SELECT parent_id FROM ${db}.tasks
+            WHERE project_id = ? AND parent_id IS NOT NULL AND assigned_to = ?
+          ))`;
+    const rootAssignedParams = admin ? [] : [req.user.id, project_id, req.user.id];
+
+    const assignedFilter = admin ? "" : "AND t.assigned_to = ?";
+    const assignedParams = admin ? [] : [req.user.id];
 
     // Metadata del catálogo ERP (módulo/épica/rol/caso de uso/prioridad/release/
     // puntos/código externo): liviana por fila, se manda siempre en el listado
@@ -330,18 +382,11 @@ projectManagerRouter.get("/partners/:project_id", async (req, res) => {
         LEFT JOIN ${db}.task_epics te ON t.epic_id = te.id
         LEFT JOIN ${db}.task_roles tr ON t.role_id = tr.id
         LEFT JOIN ${db}.task_use_cases tuc ON t.use_case_id = tuc.id
-        WHERE t.project_id = ? AND t.parent_id IS NULL
+        WHERE t.project_id = ? AND t.parent_id IS NULL ${rootAssignedFilter}
         ORDER BY t.id ASC
         `;
 
-    const [rootRows] = await conn.query(rootQuery, [project_id]);
-
-    if (!rootRows || rootRows.length === 0) {
-      return res.status(404).json({
-        status: "error",
-        message: "No se encontraron registros"
-      });
-    }
+    const [rootRows] = await conn.query(rootQuery, [project_id, ...rootAssignedParams]);
 
     const subQuery = `
         SELECT t.id, t.project_id, t.parent_id, t.title,
@@ -361,11 +406,11 @@ projectManagerRouter.get("/partners/:project_id", async (req, res) => {
         LEFT JOIN ${db}.task_epics te ON t.epic_id = te.id
         LEFT JOIN ${db}.task_roles tr ON t.role_id = tr.id
         LEFT JOIN ${db}.task_use_cases tuc ON t.use_case_id = tuc.id
-        WHERE t.project_id = ? AND t.parent_id IS NOT NULL
+        WHERE t.project_id = ? AND t.parent_id IS NOT NULL ${assignedFilter}
         ORDER BY t.id ASC
         `;
 
-    const [subRows] = await conn.query(subQuery, [project_id]);
+    const [subRows] = await conn.query(subQuery, [project_id, ...assignedParams]);
 
     const allIds = [...rootRows, ...subRows].map((r) => r.id);
     let checklistRows = [];
@@ -501,9 +546,11 @@ projectManagerRouter.post("/:project_id/import-tasks", async (req, res) => {
       project_id,
       row.insertTitle,
       row.descripcion || "",
+      row.assigned_to || null,
       row.status,
       null,
       row.tags || null,
+      row.due_date || null,
       created_by || null,
     ]);
     const newRootIds = await bulkInsertTasks(conn, db, rootInsertRows);
@@ -575,9 +622,11 @@ projectManagerRouter.post("/:project_id/import-tasks", async (req, res) => {
       project_id,
       row.insertTitle,
       row.descripcion || "",
+      row.assigned_to || null,
       row.status,
       row.parentId,
       row.tag,
+      row.due_date || null,
       created_by || null,
     ]);
     const newSubtaskIds = await bulkInsertTasks(conn, db, subtaskInsertRows);
@@ -1134,6 +1183,127 @@ projectManagerRouter.delete("/:project_id/repositories/:repo_id", async (req, re
 
   } catch (error) {
     logger.error("Error desvinculando repositorio:", error);
+
+    return res.status(500).json({
+      status: "error",
+      message: "Error interno del servidor",
+      error: error.message
+    });
+
+  } finally {
+    if (conn) conn.release();
+  }
+});
+
+// ======================== GET desarrolladores asignados a un proyecto ========================
+// Cualquier usuario autenticado con acceso al proyecto puede ver quién más
+// está asignado (útil para el propio desarrollador, no solo el admin); el
+// alta/baja sí es exclusiva del admin (ver POST/DELETE debajo).
+projectManagerRouter.get("/:project_id/developers", async (req, res) => {
+  const { project_id } = req.params;
+  let conn;
+
+  try {
+    conn = await getConnection();
+    const db = env.db.database;
+
+    const admin = await isAdminUser(conn, db, req.user.id);
+    if (!admin) {
+      const [[access]] = await conn.query(
+        `SELECT 1 FROM ${db}.project_developers WHERE project_id = ? AND user_id = ? LIMIT 1`,
+        [project_id, req.user.id]
+      );
+      if (!access) {
+        return res.status(403).json({ status: "error", message: "No tienes acceso a este proyecto" });
+      }
+    }
+
+    const [rows] = await conn.query(
+      `SELECT pd.id, pd.user_id, u.name, u.email
+       FROM ${db}.project_developers pd
+       JOIN ${db}.users u ON u.id = pd.user_id
+       WHERE pd.project_id = ? ORDER BY u.name ASC`,
+      [project_id]
+    );
+
+    return res.json({ status: "ok", data: rows });
+
+  } catch (error) {
+    logger.error("Error listando desarrolladores del proyecto:", error);
+
+    return res.status(500).json({
+      status: "error",
+      message: "Error interno del servidor",
+      error: error.message
+    });
+
+  } finally {
+    if (conn) conn.release();
+  }
+});
+
+// ======================== POST asignar desarrollador a un proyecto ========================
+projectManagerRouter.post("/:project_id/developers", requireAdmin, async (req, res) => {
+  const { project_id } = req.params;
+  const { user_id } = req.body;
+
+  if (!user_id) {
+    return res.status(400).json({ status: "error", message: "Se requiere user_id" });
+  }
+
+  let conn;
+
+  try {
+    conn = await getConnection();
+    const db = env.db.database;
+
+    await conn.query(
+      `INSERT INTO ${db}.project_developers (project_id, user_id, assigned_by) VALUES (?, ?, ?)`,
+      [project_id, user_id, req.user.id]
+    );
+
+    return res.status(201).json({ status: "ok", message: "Desarrollador asignado con éxito" });
+
+  } catch (error) {
+    if (error.code === "ER_DUP_ENTRY") {
+      return res.status(409).json({ status: "error", message: "Ese desarrollador ya está asignado a este proyecto" });
+    }
+
+    logger.error("Error asignando desarrollador:", error);
+
+    return res.status(500).json({
+      status: "error",
+      message: "Error interno del servidor",
+      error: error.message
+    });
+
+  } finally {
+    if (conn) conn.release();
+  }
+});
+
+// ======================== DELETE desasignar desarrollador ========================
+projectManagerRouter.delete("/:project_id/developers/:user_id", requireAdmin, async (req, res) => {
+  const { project_id, user_id } = req.params;
+  let conn;
+
+  try {
+    conn = await getConnection();
+    const db = env.db.database;
+
+    const [result] = await conn.query(
+      `DELETE FROM ${db}.project_developers WHERE project_id = ? AND user_id = ?`,
+      [project_id, user_id]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ status: "error", message: "No se encontró la asignación a eliminar" });
+    }
+
+    return res.json({ status: "ok", message: "Desarrollador desasignado con éxito" });
+
+  } catch (error) {
+    logger.error("Error desasignando desarrollador:", error);
 
     return res.status(500).json({
       status: "error",

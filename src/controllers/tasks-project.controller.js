@@ -86,7 +86,8 @@ tasksRouter.get("/:id", async (req, res) => {
         const db = env.db.database;
 
         const [[task]] = await conn.query(
-            `SELECT t.id, t.project_id, t.parent_id, t.title, t.description, t.tags, t.due_date, t.created_by, u.name as assigned_to, creator.name as created_by_name, t.status,
+            `SELECT t.id, t.project_id, t.parent_id, t.title, t.description, t.tags, t.due_date, t.created_by,
+             t.assigned_to as assigned_to_id, u.name as assigned_to, creator.name as created_by_name, t.status,
              t.external_code, t.priority, t.release_tag, t.story_points, t.business_rules, t.ux_notes, t.dependencies_raw,
              tm.code as module_code, tm.name as module_name,
              te.name as epic_name, tr.name as role_name,
@@ -106,6 +107,23 @@ tasksRouter.get("/:id", async (req, res) => {
             return res.status(404).json({ status: "error", message: "Tarea no encontrada" });
         }
 
+        // Mismo criterio de acceso que el listado del tablero (GET
+        // /project/partners/:id): admin siempre; si no, la tarea debe estar
+        // asignada a él, o (cuando es una raíz) tener alguna subtarea
+        // asignada a él — igual que en el tablero, para no bloquear el
+        // detalle de una HU que sí le aparece ahí por ese motivo.
+        const admin = await isAdminUser(conn, db, req.user.id);
+        if (!admin && Number(task.assigned_to_id) !== Number(req.user.id)) {
+            const [[hasAssignedSubtask]] = await conn.query(
+                `SELECT 1 FROM ${db}.tasks WHERE parent_id = ? AND assigned_to = ? LIMIT 1`,
+                [id, req.user.id]
+            );
+            if (!hasAssignedSubtask) {
+                return res.status(403).json({ status: "error", message: "No tienes acceso a esta tarea" });
+            }
+        }
+        delete task.assigned_to_id;
+
         // Criterios de aceptación (Dado/Cuando/Entonces) solo aplican a historias
         // importadas del catálogo ERP; para cualquier otra tarea queda [].
         const [acceptanceCriteria] = await conn.query(
@@ -115,14 +133,16 @@ tasksRouter.get("/:id", async (req, res) => {
         );
         task.acceptance_criteria = acceptanceCriteria;
 
+        // Mismas subtareas que vería en el tablero: si no es admin, solo las
+        // que tiene asignadas a él (no todas las de esta tarea raíz).
         const [subtasks] = await conn.query(
             `SELECT t.id, t.project_id, t.parent_id, t.title, t.description, t.tags, t.due_date, t.created_by, u.name as assigned_to, creator.name as created_by_name, t.status
              FROM ${db}.tasks t
              LEFT JOIN ${db}.users u ON t.assigned_to = u.id
              LEFT JOIN ${db}.users creator ON t.created_by = creator.id
-             WHERE t.parent_id = ?
+             WHERE t.parent_id = ? ${admin ? "" : "AND t.assigned_to = ?"}
              ORDER BY t.id ASC`,
-            [id]
+            admin ? [id] : [id, req.user.id]
         );
 
         const allIds = [task.id, ...subtasks.map((s) => s.id)];
