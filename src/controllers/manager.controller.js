@@ -341,23 +341,14 @@ projectManagerRouter.get("/partners/:project_id", async (req, res) => {
     // (GET /task/:id) cuando se abre el detalle.
     const DESCRIPTION_PREVIEW_LENGTH = 300;
 
-    // Un no-admin (desarrollador) solo ve las tareas/subtareas que tiene
-    // asignadas específicamente (assigned_to), no todo el proyecto — aunque
-    // ya haya pasado el chequeo de acceso de arriba. Para las raíces, además
-    // de las asignadas a él directo, se incluyen las que son padre de alguna
-    // subtarea asignada a él (para no perder el contexto de esa subtarea) —
-    // sin eso, "HU sin asignar con una subtarea sí asignada a mí" desaparece
-    // por completo del tablero.
-    const rootAssignedFilter = admin
-      ? ""
-      : `AND (t.assigned_to = ? OR t.id IN (
-            SELECT parent_id FROM ${db}.tasks
-            WHERE project_id = ? AND parent_id IS NOT NULL AND assigned_to = ?
-          ))`;
-    const rootAssignedParams = admin ? [] : [req.user.id, project_id, req.user.id];
+    // Si el usuario tiene acceso al proyecto (ya validado arriba en project_developers),
+    // puede ver TODAS las HUs del proyecto, no solo las asignadas a él.
+    // El chequeo de acceso al proyecto es suficiente garantía de permisos.
+    const rootAssignedFilter = "";
+    const rootAssignedParams = [];
 
-    const assignedFilter = admin ? "" : "AND t.assigned_to = ?";
-    const assignedParams = admin ? [] : [req.user.id];
+    const assignedFilter = "";
+    const assignedParams = [];
 
     // Metadata del catálogo ERP (módulo/épica/rol/caso de uso/prioridad/release/
     // puntos/código externo): liviana por fila, se manda siempre en el listado
